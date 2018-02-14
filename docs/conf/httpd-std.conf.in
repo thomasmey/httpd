@@ -219,6 +219,27 @@ MaxRequestsPerChild    0
 @nonssl_listen_stmt_2@
 
 #
+# ListenSCTP: Allows you to bind Apache to specific IP addresses and/or
+# ports, using the SCTP transport protocol. Multiple IP addresses may be
+# specified to take advantage of SCTP's multi-homing capability. At this
+# time, the specification of multiple addresses requires that all
+# addresses be specified as numeric IPV4 addresses. Note that the first
+# address in a list becomes the primary address for the ssociation.
+#
+# Change this to listen on specific IP addresses as shown below and to
+# prevent Apache from glomming onto all bound IP addresses (0.0.0.0)
+#
+#ListenSCTP 12.34.56.78:4000
+#ListenSCTP www.mysite.org
+#ListenSCTP {12.34.56.78}:4000
+#ListenSCTP {www.mysite.org}:4000
+#ListenSCTP {1.2.3.4, 5.6.7.8}:4000
+#ListenSCTP {www.mysite.org, 5.6.7.8}:4000  <-- Illegal to mix numeric
+#                                           and non-numeric addresses
+#                                           when specifying multiple
+#                                           addresses.
+
+#
 # Dynamic Shared Object (DSO) Support
 #
 # To be able to use the functionality of a module which was built as a DSO you

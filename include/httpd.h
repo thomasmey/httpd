@@ -996,6 +996,15 @@ struct conn_rec {
     void *sbh;
     /** The bucket allocator to use for all bucket/brigade creations */
     struct apr_bucket_alloc_t *bucket_alloc;
+
+   /** Transport protocol that this connection uses */
+   /*
+    * PN - 10/14/2005
+    * protocol is needed in check_pipeline_flush.
+    * For detailed comments check this function in http_request.c
+    */
+   apr_int32_t transport_protocol;
+
 };
 
 /* Per-vhost config... */
@@ -1106,6 +1115,12 @@ typedef struct core_filter_ctx {
 typedef struct core_net_rec {
     /** Connection to the client */
     apr_socket_t *client_socket;
+
+    /** SCTP stream information for this network record */
+    /*
+     * PN - 8/15/2005
+     */
+    apr_uint16_t sctp_stream_info;
 
     /** connection record */
     conn_rec *c;

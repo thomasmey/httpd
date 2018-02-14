@@ -2904,6 +2904,70 @@ void ap_add_output_filters_by_type(request_rec *r)
     return;
 }
 
+/**
+ * Achieves the same as writev_it_all.
+ * Takes in an extra parameter- the SCTP stream id to write on
+ * @param stream_id SCTP stream id to send on
+ */
+
+/*
+ * PN - 8/30/2005
+ * writev_it_all_sctp
+ * Similar code and args as writev_it_all.
+ * 1 extra arg: SCTP stream id to do the write on.
+ * Calls apr_socket_sendv_sctp to do the actual write
+ * Function used/visible only in core.c
+ */
+
+#if APR_HAS_SCTP_STREAMS
+
+static apr_status_t writev_it_all_sctp(apr_socket_t *s,
+                       struct iovec *vec, int nvec, apr_size_t len,
+                       apr_size_t *nbytes, apr_uint16_t stream_id)
+{
+    apr_size_t bytes_written = 0;
+    apr_status_t rv;
+    apr_size_t n = len;
+    int i = 0;
+
+    *nbytes = 0;
+
+    /* XXX handle checking for non-blocking socket */
+    while (bytes_written != len) {
+        rv = apr_socket_sendv_sctp(s, vec + i, nvec - i, &n, stream_id);
+        bytes_written += n;
+        if (rv != APR_SUCCESS)
+            return rv;
+
+        *nbytes += n;
+
+        /* If the write did not complete, adjust the iovecs and issue
+         * apr_socket_sendv_sctp again
+         */
+
+        if (bytes_written < len) {
+            /* Skip over the vectors that have already been written */
+            apr_size_t cnt = vec[i].iov_len;
+            while (n >= cnt && i + 1 < nvec) {
+                i++;
+                cnt += vec[i].iov_len;
+            }
+
+            if (n < cnt) {
+                /* Handle partial write of vec i */
+                vec[i].iov_base = (char *) vec[i].iov_base +
+                    (vec[i].iov_len - (cnt - n));
+                vec[i].iov_len = cnt -n;
+            }
+        }
+
+        n = len - bytes_written;
+    }
+
+    return APR_SUCCESS;
+}
+#endif  /* End APR_HAS_SCTP_STREAMS */
+
 static apr_status_t writev_it_all(apr_socket_t *s,
                                   struct iovec *vec, int nvec,
                                   apr_size_t len, apr_size_t *nbytes)
@@ -3041,6 +3105,104 @@ static apr_status_t sendfile_it_all(core_net_rec *c,
     } while (1);
 }
 #endif
+
+#if APR_HAS_SCTP_STREAMS
+
+/*
+ * emulate_sendfile_sctp()
+ * Similar code and args as emulate_sendfile.
+ * 1 extra arg: SCTP stream id to send the file on.
+ * Calls apr_socket_send_sctp and writev_it_all_sctp to do the actual write
+ * Function used/visible only in core.c
+ */
+
+static apr_status_t emulate_sendfile_sctp(core_net_rec *c, apr_file_t *fd,
+                                     apr_hdtr_t *hdtr, apr_off_t offset,
+                                     apr_size_t length, apr_size_t *nbytes)
+{
+    apr_status_t rv = APR_SUCCESS;
+    apr_int32_t togo;        /* Remaining number of bytes in the file to send */
+    apr_size_t sendlen = 0;
+    apr_size_t bytes_sent;
+    apr_int32_t i;
+    apr_off_t o;             /* Track the file offset for partial writes */
+    char buffer[8192];
+
+    *nbytes = 0;
+    /* Send the headers
+     * writev_it_all handles partial writes.
+     * XXX: optimization... if headers are less than MIN_WRITE_SIZE, copy
+     * them into buffer
+     */
+    if (hdtr && hdtr->numheaders > 0 ) {
+        for (i = 0; i < hdtr->numheaders; i++) {
+            sendlen += hdtr->headers[i].iov_len;
+        }
+
+        rv = writev_it_all_sctp(c->client_socket, hdtr->headers,
+                hdtr->numheaders, sendlen, &bytes_sent,
+                c->sctp_stream_info);
+
+        if (rv == APR_SUCCESS)
+            *nbytes += bytes_sent;     /* track total bytes sent */
+    }
+
+    /* Seek the file to 'offset' */
+    if (offset >= 0 && rv == APR_SUCCESS) {
+        rv = apr_file_seek(fd, APR_SET, &offset);
+    }
+
+   /* Send the file, making sure to handle partial writes */
+    togo = length;
+    while (rv == APR_SUCCESS && togo) {
+        sendlen = togo > sizeof(buffer) ? sizeof(buffer) : togo;
+        o = 0;
+
+        /*
+         * PN - 9/20/2005
+         * Chunking messages to be of size = 1408 bytes, which is
+         * the recommended SCTP msg chunk size, for better performance
+         */
+        if (sendlen > 1408) {
+                sendlen = 1408;
+        }
+        rv = apr_file_read(fd, buffer, &sendlen);
+        while (rv == APR_SUCCESS && sendlen) {
+            bytes_sent = sendlen;
+
+            rv = apr_socket_send_sctp(c->client_socket, &buffer[o],
+                        &bytes_sent, c->sctp_stream_info);
+
+            if (rv == APR_SUCCESS) {
+                sendlen -= bytes_sent; /* sendlen != bytes_sent=>partial write */
+                o += bytes_sent;       /* o is where we are in the buffer */
+                *nbytes += bytes_sent;
+                togo -= bytes_sent;    /* track how much of the file we've sent */
+            }
+        }
+    }
+
+    /* Send the trailers
+     * XXX: optimization... if it will fit, send this on the last send in the
+     * loop above
+     */
+    sendlen = 0;
+    if ( rv == APR_SUCCESS && hdtr && hdtr->numtrailers > 0 ) {
+        for (i = 0; i < hdtr->numtrailers; i++) {
+            sendlen += hdtr->trailers[i].iov_len;
+        }
+
+        rv = writev_it_all_sctp(c->client_socket, hdtr->trailers,
+               hdtr->numtrailers, sendlen, &bytes_sent, c->sctp_stream_info);
+
+        if (rv == APR_SUCCESS)
+            *nbytes += bytes_sent;
+    }
+
+    return rv;
+}
+#endif /* End APR_HAS_SCTP_STREAMS */
+
 
 /*
  * emulate_sendfile()
@@ -3726,6 +3888,47 @@ static void brigade_move(apr_bucket_brigade *b, apr_bucket_brigade *a,
 }
 
 
+/**
+ * PN - 10/20/2005
+ * This is a helper function local to core.c
+ * Takes in bucket with SCTP stream id information and copies it
+ * to core_net_rec structure
+ */
+static int get_sctp_stream_information(apr_bucket *sctp_stream_bkt,
+                                       core_net_rec *net)
+{
+
+    const char *str;
+    apr_size_t len;
+    apr_status_t ret_val;
+
+    /* read the heap bucket for SCTP stream information */
+    ret_val = apr_bucket_read(sctp_stream_bkt, &str,
+                            &len, APR_BLOCK_READ);
+    if (ret_val != APR_SUCCESS) {
+
+       /* Uncomment for debugging */
+       /* ap_log_error(APLOG_MARK, APLOG_NOTICE, ret_val, NULL,
+                    "Core Input Filter: bucket read error: %d\n", ret_val); */
+        return ret_val;
+    }
+
+    /*
+     * Copy the SCTP stream id to the
+     * core_net_rec for this request
+     */
+
+    memcpy(&(net->sctp_stream_info), str, sizeof(apr_uint16_t));
+
+    /* Uncomment for debugging */
+    /* ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, NULL,
+                        "Core Input Filter: SCTP Stream: %ho",
+                        net->sctp_stream_info); */
+
+    return APR_SUCCESS;
+
+}
+
 static int core_input_filter(ap_filter_t *f, apr_bucket_brigade *b,
                              ap_input_mode_t mode, apr_read_type_e block,
                              apr_off_t readbytes)
@@ -3736,6 +3939,9 @@ static int core_input_filter(ap_filter_t *f, apr_bucket_brigade *b,
     core_ctx_t *ctx = net->in_ctx;
     const char *str;
     apr_size_t len;
+
+    /* PN - 08/15/2005 */
+    apr_int32_t protocol = 0;
 
     if (mode == AP_MODE_INIT) {
         /*
@@ -3779,9 +3985,68 @@ static int core_input_filter(ap_filter_t *f, apr_bucket_brigade *b,
         return APR_EOF;
     }
 
+    /*
+     * PN - 10/17/2005
+     */
+
+#if APR_HAS_SCTP_STREAMS
+
+    if (APR_BUCKET_IS_SOCKET(APR_BRIGADE_FIRST(ctx->b))) {
+
+        /*
+         * PN - 10/17/2005
+         * protocol is non-zero only if first bucket in ctx->b
+         * is a socket bucket. Else zero as defined during decl.
+         */
+
+        apr_socket_protocol_get((apr_socket_t *)(net->client_socket),
+                                       &protocol);
+
+    }
+#endif /* End APR_HAS_SCTP_STREAMS */
+
+
     if (mode == AP_MODE_GETLINE) {
         /* we are reading a single LF line, e.g. the HTTP headers */
         rv = apr_brigade_split_line(b, ctx->b, block, HUGE_STRING_LEN);
+
+        /*
+         * PN - 8/16/2005
+         * if (APR_HAS_SCTP_STREAMS and protcol == SCTP), then
+         * after calling apr_brigade_split_line,
+         * first bucket in b (apr_brigade_split_line's bbOut)
+         * will be a heap bucket having the
+         * SCTP stream id on which the HTTP request was read from client.
+         */
+
+#if APR_HAS_SCTP_STREAMS
+
+        if (rv == APR_SUCCESS) {
+
+                   if (protocol == APR_PROTO_SCTP) {
+
+                /*
+                 * protocol non-zero implies socket read
+                 */
+               apr_bucket *sctp_stream_info = APR_BRIGADE_FIRST(b);
+               apr_status_t ret_val;
+
+               /* Get the sctp stream information */
+               ret_val = get_sctp_stream_information(sctp_stream_info, net);
+               if (ret_val != APR_SUCCESS)
+                       return ret_val;
+
+	       /*
+                * Remove and destroy the bucket with SCTP stream information
+                */
+               apr_bucket_delete(sctp_stream_info);
+
+            } /* end APR_PROTO_SCTP */
+
+        } /* end rv == SUCCESS */
+
+#endif  /* End APR_HAS_SCTP_STREAMS */
+
         /* We should treat EAGAIN here the same as we do for EOF (brigade is
          * empty).  We do this by returning whatever we have read.  This may
          * or may not be bogus, but is consistent (for now) with EOF logic.
@@ -3818,6 +4083,26 @@ static int core_input_filter(ap_filter_t *f, apr_bucket_brigade *b,
 
             if (rv != APR_SUCCESS)
                 return rv;
+
+#if APR_HAS_SCTP_STREAMS
+
+           if (protocol == APR_PROTO_SCTP) {
+
+                /*
+                 * protocol non-zero implies socket read
+                 */
+               apr_bucket *sctp_stream_info = APR_BUCKET_PREV(e);
+               apr_status_t ret_val;
+
+               /* Get the sctp stream information */
+               ret_val = get_sctp_stream_information(sctp_stream_info, net);
+               if (ret_val != APR_SUCCESS)
+                       return ret_val;
+
+               /* Remove and destroy the bucket with SCTP stream information */
+               apr_bucket_delete(sctp_stream_info);
+           }
+#endif
 
             c = str;
             while (c < str + len) {
@@ -3950,6 +4235,13 @@ static apr_status_t core_output_filter(ap_filter_t *f, apr_bucket_brigade *b)
     core_output_filter_ctx_t *ctx = net->out_ctx;
     apr_read_type_e eblock = APR_NONBLOCK_READ;
     apr_pool_t *input_pool = b->p;
+
+    /*
+     * PN - 10/13/2005
+     * Get the transport protocol apache is using
+     */
+    apr_int32_t protocol = 0;
+    apr_socket_protocol_get((apr_socket_t *)(net->client_socket), &protocol);
 
     if (ctx == NULL) {
         ctx = apr_pcalloc(c->pool, sizeof(*ctx));
@@ -4236,15 +4528,37 @@ static apr_status_t core_output_filter(ap_filter_t *f, apr_bucket_brigade *b)
                 hdtr.trailers = vec_trailers;
             }
 
+            /*
+             * PN - 10/17/2005
+             * sendfile_it_all/sendfile cannot send on a SCTP stream. So, 
+             * if (APR_HAS_SCTP_STREAMS and protocol == SCTP) then
+             * use emulate_sendfile_sctp
+             * else do the ususal processing as before to send the file.
+             */
+#if APR_HAS_SCTP_STREAMS
+
+            if (protocol == APR_PROTO_SCTP) {
+               /* Uncomment for debugging */
+                /* ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, NULL,
+                        "Core Output Filter: SCTP Stream: %ho",
+                                net->sctp_stream_info); */
+                rv = emulate_sendfile_sctp(net, fd, &hdtr, foffset, flen,
+                                      &bytes_sent);
+            }
+           else
+#endif /* End APR_HAS_SCTP_STREAMS */
+           {
+
 #if APR_HAS_SENDFILE
-            if (apr_file_flags_get(fd) & APR_SENDFILE_ENABLED) {
+                if (apr_file_flags_get(fd) & APR_SENDFILE_ENABLED) {
 
-                if (c->keepalive == AP_CONN_CLOSE && APR_BUCKET_IS_EOS(last_e)) {
-                    /* Prepare the socket to be reused */
-                    flags |= APR_SENDFILE_DISCONNECT_SOCKET;
-                }
+                   if (c->keepalive == AP_CONN_CLOSE &&
+                       APR_BUCKET_IS_EOS(last_e)) {
+                        /* Prepare the socket to be reused */
+                        flags |= APR_SENDFILE_DISCONNECT_SOCKET;
+                    }
 
-                rv = sendfile_it_all(net,      /* the network information   */
+                    rv = sendfile_it_all(net,    /* the network information   */
                                      fd,       /* the file to send          */
                                      &hdtr,    /* header and trailer iovecs */
                                      foffset,  /* offset in the file to begin
@@ -4256,27 +4570,47 @@ static apr_status_t core_output_filter(ap_filter_t *f, apr_bucket_brigade *b)
                                                        sent                 */
                                      flags);   /* apr_sendfile flags        */
 
-                if (logio_add_bytes_out && bytes_sent > 0)
-                    logio_add_bytes_out(c, bytes_sent);
-            }
-            else
+                    if (logio_add_bytes_out && bytes_sent > 0)
+                       logio_add_bytes_out(c, bytes_sent);
+               }
+               else
 #endif
-            {
-                rv = emulate_sendfile(net, fd, &hdtr, foffset, flen,
+               {
+                    rv = emulate_sendfile(net, fd, &hdtr, foffset, flen,
                                       &bytes_sent);
 
-                if (logio_add_bytes_out && bytes_sent > 0)
-                    logio_add_bytes_out(c, bytes_sent);
-            }
+                    if (logio_add_bytes_out && bytes_sent > 0)
+                       logio_add_bytes_out(c, bytes_sent);
+               }
+
+           }
 
             fd = NULL;
+
         }
         else {
             apr_size_t bytes_sent;
+           /*
+             * PN - 10/17/2005
+             * if (APR_HAS_SCTP_STREAMS and protocol == SCTP) then
+             * use emulate_sendfile_sctp else use emulate_sendfile
+             * to send the data
+             */
+#if APR_HAS_SCTP_STREAMS
 
-            rv = writev_it_all(net->client_socket,
-                               vec, nvec,
-                               nbytes, &bytes_sent);
+            if (protocol == APR_PROTO_SCTP) {
+                rv = writev_it_all_sctp(net->client_socket, vec, nvec,
+                            nbytes, &bytes_sent, net->sctp_stream_info);
+
+           }
+            else
+
+#endif  /* End APR_HAS_SCTP_STREAMS */
+           {
+
+                rv = writev_it_all(net->client_socket, vec, nvec,
+                           nbytes, &bytes_sent);
+           }
 
             if (logio_add_bytes_out && bytes_sent > 0)
                 logio_add_bytes_out(c, bytes_sent);
@@ -4478,6 +4812,12 @@ static conn_rec *core_create_conn(apr_pool_t *ptrans, server_rec *server,
 
     c->id = id;
     c->bucket_alloc = alloc;
+
+    /*
+     * PN - 10/14/2005
+     * Put in the transport layer protocol that this connection will use
+     */
+    apr_socket_protocol_get(csd, &(c->transport_protocol));
 
     return c;
 }

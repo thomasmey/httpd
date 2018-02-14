@@ -206,19 +206,87 @@ static void check_pipeline_flush(request_rec *r)
      */
     /* ### shouldn't this read from the connection input filters? */
     /* ### is zero correct? that means "read one line" */
-    if (r->connection->keepalive == AP_CONN_CLOSE || 
-        ap_get_brigade(r->input_filters, bb, AP_MODE_EATCRLF, 
-                       APR_NONBLOCK_READ, 0) != APR_SUCCESS) {
+
+    /*
+     * PN - 10/14/2005
+     * if (APR_HAS_SCTP_STREAMS &&
+     *          request->connection->transport_protocol == SCTP) then
+     *                 flush the response immediately. See below for why
+     */
+
+#if APR_HAS_SCTP_STREAMS
+
+    if (c->transport_protocol == APR_PROTO_SCTP) {
+
+        /* SCTP streams in effect */
+
+        /*
+         * PN - 8/31/2005
+         * Changing check_pipeline_flush processing for
+         * SCTP w streams implementation.
+         *
+         * Why?
+         *
+         * Problem :
+         *      - A HTTP client doing a back to back GET request using TCP;
+         *        both GETs were read by a single socket_bucket_read during the
+         *        first core_input_filter and were processed just fine.
+         *      - But, with SCTP, the back to back GETs cannot be
+         *        read by a single socket_bucket_read since potentially these
+         *        2 requests can come on different SCTP streams, which should
+         *        be passed on to the caller.
+         *      - check_pipeline_flush is intended for reading such
+         *        back to back piplelined GETs.
+         *      - So, if SCTP, the second GET is read during the ap_get_brigade
+         *        in this check_pipeline_flush function.
+         *      - But there seems to be _unknown_ problems (didnt debug)
+         *        while reading a GET on SCTP here. Not sure why, but
+         *        only the headers of the first GET were received at the
+         *        client.
+         *
+         * Analysis :
+         *      - Considering the problem further, with SCTP, each response
+         *        should go in a separate sctp_sendmsg or sendmsg since
+         *        different responses can ideally go on different SCTP streams.
+         *        If there are going to be multiple such sends anyways,
+         *        why to wait and flush response later? Since, the
+         *        bottom line for waiting for pipelined requests is to send
+         *        all the HTTP responses in one go (?)
+         *        Or is there possibly any other reason ??
+         *
+         * Solution :
+         *      - Can flush response NOW irrespective of whether
+         *        there are pending requests to read.
+         *        Future calls to ap_read_request will end up reading
+         *        these pending requests.
+         */
+
         apr_bucket *e = apr_bucket_flush_create(c->bucket_alloc);
 
-        /* We just send directly to the connection based filters.  At
-         * this point, we know that we have seen all of the data
-         * (request finalization sent an EOS bucket, which empties all
-         * of the request filters). We just want to flush the buckets
-         * if something hasn't been sent to the network yet.
-         */
         APR_BRIGADE_INSERT_HEAD(bb, e);
         ap_pass_brigade(r->connection->output_filters, bb);
+    }
+    else
+
+#endif  /* End APR_HAS_SCTP_STREAMS */
+
+    {
+        /* No SCTP stream. Do the usual */
+
+       if (r->connection->keepalive == AP_CONN_CLOSE ||
+            ap_get_brigade(r->input_filters, bb, AP_MODE_EATCRLF,
+                       APR_NONBLOCK_READ, 0) != APR_SUCCESS) {
+               apr_bucket *e = apr_bucket_flush_create(c->bucket_alloc);
+
+               /* We just send directly to the connection based filters.  At
+                * this point, we know that we have seen all of the data
+                * (request finalization sent an EOS bucket, which empties all
+                * of the request filters). We just want to flush the buckets
+                * if something hasn't been sent to the network yet.
+                */
+               APR_BRIGADE_INSERT_HEAD(bb, e);
+               ap_pass_brigade(r->connection->output_filters, bb);
+       }
     }
 }
 

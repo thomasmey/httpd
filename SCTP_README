@@ -1,0 +1,109 @@
+SCTP_README - SCTP Readme for httpd-2.0.55
+------------------------------------------
+
+2013-MAR-21, J. Leighton, leighton@cis.udel.edu
+- Added ListenSCTP directive for specifying the use of SCTP in place of TCP. The
+  older symantics which included appending /<protocol> to the end of the
+  argument to the Listen directive are no longer valid. The ListenSCTP directive
+  also supports binding the listen socket to multiple IPV4 addresses. Multiple
+  IPV4 addresses are specified as a comma separated list enclosed in braces, and
+  must be followed by an explicit port number. For example:
+
+       ListenSCTP {1.2.3.4, 5.6.7.8}:90
+
+  At this time, only numeric IPV4 addresses are supported when specifying
+  multiple addresses. For example, {128.175.99.24, 10.1.102.2}:4000 is valid
+  and {chablis.cis.udel.edu}:4000 is valid, but
+  {chablis.cis.udel.edu, 10.1.102.2}:4000 is not valid. Note that the first
+  address in the list is the primary address for the association.
+ 
+- This version is distributed as a tarball containing the modified source code,
+  and not as a patch to be applied to the original source code.
+
+2013-FEB-06, J. Leighton, leighton@cis.udel.edu
+- apr/configure.in modified to support building on both FreeBSD and linux.
+- apr/configure script recreated with autoconf 2.59.
+
+
+2006-FEB-17, P. Natarajan, pnatar@cisco.com
+Please submit bug reports to pel at cis dot udel dot edu
+
+Installation
+------------
+
+1.  Download and untar original httpd-2.0.55 sources from http://apache.org or http://pel.cis.udel.edu
+
+2.  Download SCTP patch for httpd-2.0.55 from http://pel.cis.udel.edu
+
+3.  At the parent directory of the untar'd httpd-2.0.55 sources, do:
+	%> patch < SCTP_httpd-2.0.55.patch
+
+4.  Configure and Install the patched httpd-2.0.55 as per the INSTALL file in httpd-2.0.55 sources directory.
+
+
+Introduction to SCTP
+--------------------
+
+Stream Control Transmission Protocol (SCTP) is a transport layer protocol 
+capable of providing reliable (in-order, no loss, no duplicates, no error)
+message oriented service to application.
+Other interesting features of SCTP include multistreaming (many logical pipes
+in 1 SCTP association to transfer independent data without head of line 
+blocking problem) and multihoming (ability to support more than 1 interface/
+IP address at a SCTP endpoint). 
+
+Further details on SCTP
+-----------------------
+
+o Stream Control Transmission Protocol, RFC 2960.
+o www.sctp.org
+o www.eecis.udel.edu/~amer/PEL/poc/index.html
+
+Apache over SCTP
+----------------
+
+Changes have been made to apache to make it run on SCTP if admin wishes.
+
+o Listen directive in the httpd config file can take the transport layer
+  protocol as an extra argument along with IP address and port number.
+  This can be either 'sctp' or 'tcp'. If none specified, default protocol
+  will be TCP. Refer to httpd.conf for further details.
+o If the httpd configure process identifies support for use of SCTP streams
+  by system, SCTP streams can be used to send/receive HTTP responses/requests.
+  Refer to apr/configure.in for further details. If no such support is
+  identified, SCTP without streams can still be used by the user.
+o With SCTP streams, every HTTP request can be read on a separate SCTP
+  stream and its response is sent on the same stream.
+
+Known Issues
+------------
+
+This patch has been developed/built/tested on FreeBSD 5.4 with KAME-SCTP.
+The following issues are still open on this environment. 
+
+o When apache sends a file using sendfile C library function on a SCTP
+  socket, the system crashes. To avoid this, do EnableSendFile Off in
+  httpd.conf
+o When a peer closes a SCTP association, read returns -1 with error set
+  to EAGAIN/EWOULDBLOCK as opposed to returning 0 (and no error).
+  Refer to apr/network_io/unix/sendrecv.c for further details and workaround.
+
+To Do
+-----
+
+o The number of SCTP streams to be negotiated during association setup
+  is hardcoded. Can be made user configurable through a directive.
+o The number of association initiation attempts is hardcoded to 3.
+  Can be made user configurable through a directive.
+o Use of sendmsg/recvmsg functions to send/recv data on a SCTP stream.
+  Can be changed to sctp_sendmsg/sctp_recvmsg.
+
+Credits/Contact
+---------------
+
+Preethi Natarajan (nataraja@cis.udel.edu)
+Dr. Paul Amer (amer@cis.udel.edu)
+Protocol Engineering Lab,
+University of Delaware,
+Newark, DE.
+

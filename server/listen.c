@@ -231,7 +231,8 @@ static void find_default_family(apr_pool_t *p)
 }
 
 
-static const char *alloc_listener(process_rec *process, char *addr, apr_port_t port)
+static const char *alloc_listener(process_rec *process, char *addr,
+				apr_int32_t protocol, apr_port_t port)
 {
     ap_listen_rec **walk;
     ap_listen_rec *new;
@@ -263,7 +264,18 @@ static const char *alloc_listener(process_rec *process, char *addr, apr_port_t p
         /* Some listeners are not real so they will not have a bind_addr. */
         if (sa) {
             apr_sockaddr_port_get(&oldport, sa);
-            if (!strcmp(sa->hostname, addr) && port == oldport) {
+            char *test_addr = addr;
+            /* JTL - 2013-MAR-20
+             * test modified to accomodate ListenSCTP directive possibly
+             * storing multiple IP addresses in addr. Only want to test the
+             * the first address in addr */
+#if APR_HAVE_SCTP
+            char *end_addr;
+            //check for muliple IPs and grab first one only
+            if (addr && (end_addr = memchr(addr, ',', strlen(addr))))
+                test_addr = apr_pstrmemdup(process->pool, addr, end_addr - addr);
+#endif
+            if (!strcmp(sa->hostname, test_addr) && port == oldport) {
                 /* re-use existing record */
                 new = *walk;
                 *walk = new->next;
@@ -283,15 +295,34 @@ static const char *alloc_listener(process_rec *process, char *addr, apr_port_t p
         ap_log_perror(APLOG_MARK, APLOG_CRIT, status, process->pool,
                       "alloc_listener: failed to set up sockaddr for %s",
                       addr);
-        return "Listen setup failed";
+        if (protocol == APR_PROTO_SCTP)
+            return "ListenSCTP setup failed";
+        else
+            return "Listen setup failed";
     }
-    if ((status = apr_socket_create(&new->sd,
-                                    new->bind_addr->family,
-                                    SOCK_STREAM, process->pool))
-        != APR_SUCCESS) {
+
+    /*
+     * PN - 8/16/2005
+     * apr_socket_create_ex takes protocol as an extra argument.
+     * For adapting this code to later versions of httpd, find the
+     * suitable apr_socket_create function that takes in protocol as
+     * an argument.
+     *
+     * if ((status = apr_socket_create(&new->sd,
+     *                                   new->bind_addr->family,
+     *                                   SOCK_STREAM, process->pool))
+     *       != APR_SUCCESS) {
+     */
+
+    if ((status = apr_socket_create_ex(&new->sd, new->bind_addr->family,
+                                       SOCK_STREAM, protocol, process->pool)) !=
+        APR_SUCCESS) {
         ap_log_perror(APLOG_MARK, APLOG_CRIT, status, process->pool,
                       "alloc_listener: failed to get a socket for %s", addr);
-        return "Listen setup failed";
+        if (protocol == APR_PROTO_SCTP)
+            return "ListenSCTP setup failed";
+        else
+            return "Listen setup failed";
     }
 
     new->next = ap_listeners;
@@ -406,7 +437,27 @@ const char *ap_set_listener(cmd_parms *cmd, void *dummy, const char *ips)
         return err;
     }
 
-    rv = apr_parse_addr_port(&host, &scope_id, &port, ips, cmd->pool);
+    /*
+     * PN - 8/16/2005
+     */
+    apr_uint32_t protocol = APR_PROTO_TCP;
+
+#if APR_HAVE_SCTP
+    char *data = cmd->cmd->cmd_data;
+    if (data) {
+        if(!strncmp(data, "SCTP", 4)) {
+            protocol = APR_PROTO_SCTP;
+            rv = apr_parse_multiaddr_port(&host, &scope_id, &port, ips,
+                                          cmd->pool);
+        } else {
+            return "Invalid cmd_data specified in cmd->cmd->cmd_data";
+        }
+    } else
+#endif
+    {
+        rv = apr_parse_addr_port(&host, &scope_id, &port, ips, cmd->pool);
+    }
+
     if (rv != APR_SUCCESS) {
         return "Invalid address or port";
     }
@@ -424,7 +475,14 @@ const char *ap_set_listener(cmd_parms *cmd, void *dummy, const char *ips)
         return "Port must be specified";
     }
 
-    return alloc_listener(cmd->server->process, host, port);
+    /*
+     * PN - 8/16/2005
+     * Calling the alloc_listener that takes protocol as arg
+     *
+     * return alloc_listener(cmd->server->process, host, port);
+     */
+
+    return alloc_listener(cmd->server->process, host, protocol, port);
 }
 
 const char *ap_set_listenbacklog(cmd_parms *cmd, void *dummy, const char *arg)
