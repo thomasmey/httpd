@@ -1137,6 +1137,15 @@ struct conn_rec {
     void *sbh;
     /** The bucket allocator to use for all bucket/brigade creations */
     struct apr_bucket_alloc_t *bucket_alloc;
+
+    /** Transport protocol that this connection uses */
+    /*
+     * PN - 10/14/2005
+     * protocol is needed in check_pipeline_flush.
+     * For detailed comments check the function in http_request.c
+     */
+    apr_int32_t transport_protocol;
+
     /** The current state of this connection; may be NULL if not used by MPM */
     conn_state_t *cs;
     /** Is there data pending in the input filters? */

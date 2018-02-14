@@ -3956,7 +3956,77 @@ static const char *set_http_protocol_options(cmd_parms *cmd, void *dummy,
     return NULL;
 }
 
+<<<<<<< HEAD
 static const char *set_http_method(cmd_parms *cmd, void *conf, const char *arg)
+=======
+/**
+ * Achieves the same as writev_it_all.
+ * Takes in an extra parameter- the SCTP stream id to write on
+ * @param stream_id SCTP stream id to send on
+ */
+
+/*
+ * PN - 8/30/2005
+ * writev_it_all_sctp
+ * Similar code and args as writev_it_all.
+ * 1 extra arg: SCTP stream id to do the write on.
+ * Calls apr_socket_sendv_sctp to do the actual write
+ * Function used/visible only in core.c
+ */
+
+#if APR_HAS_SCTP_STREAMS
+
+static apr_status_t writev_it_all_sctp(apr_socket_t *s,
+                       struct iovec *vec, int nvec, apr_size_t len,
+                       apr_size_t *nbytes, apr_uint16_t stream_id)
+{
+    apr_size_t bytes_written = 0;
+    apr_status_t rv;
+    apr_size_t n = len;
+    int i = 0;
+
+    *nbytes = 0;
+
+    /* XXX handle checking for non-blocking socket */
+    while (bytes_written != len) {
+        rv = apr_socket_sendv_sctp(s, vec + i, nvec - i, &n, stream_id);
+        bytes_written += n;
+        if (rv != APR_SUCCESS)
+            return rv;
+
+        *nbytes += n;
+
+        /* If the write did not complete, adjust the iovecs and issue
+         * apr_socket_sendv_sctp again
+         */
+
+        if (bytes_written < len) {
+            /* Skip over the vectors that have already been written */
+            apr_size_t cnt = vec[i].iov_len;
+            while (n >= cnt && i + 1 < nvec) {
+                i++;
+                cnt += vec[i].iov_len;
+            }
+
+            if (n < cnt) {
+                /* Handle partial write of vec i */
+                vec[i].iov_base = (char *) vec[i].iov_base +
+                    (vec[i].iov_len - (cnt - n));
+                vec[i].iov_len = cnt -n;
+            }
+        }
+
+        n = len - bytes_written;
+    }
+
+    return APR_SUCCESS;
+}
+#endif  /* End APR_HAS_SCTP_STREAMS */
+
+static apr_status_t writev_it_all(apr_socket_t *s,
+                                  struct iovec *vec, int nvec,
+                                  apr_size_t len, apr_size_t *nbytes)
+>>>>>>> 6036f4fa90... Add SCTP support
 {
     const char *err = ap_check_cmd_context(cmd, GLOBAL_ONLY);
     if (err != NULL)
@@ -4180,10 +4250,167 @@ static const char *set_errorlog_format(cmd_parms *cmd, void *dummy,
                                                   sizeof(apr_array_header_t *));
         }
 
+<<<<<<< HEAD
         if (*arg2) {
             apr_array_header_t **e;
             e = (apr_array_header_t **) apr_array_push(conf->error_log_conn);
             *e = parse_errorlog_string(cmd->pool, arg2, &err_string, 0);
+=======
+#if APR_HAS_SCTP_STREAMS
+
+/*
+ * emulate_sendfile_sctp()
+ * Similar code and args as emulate_sendfile.
+ * 1 extra arg: SCTP stream id to send the file on.
+ * Calls apr_socket_send_sctp and writev_it_all_sctp to do the actual write
+ * Function used/visible only in core.c
+ */
+
+static apr_status_t emulate_sendfile_sctp(core_net_rec *c, apr_file_t *fd,
+                                     apr_hdtr_t *hdtr, apr_off_t offset,
+                                     apr_size_t length, apr_size_t *nbytes)
+{
+    apr_status_t rv = APR_SUCCESS;
+    apr_int32_t togo;        /* Remaining number of bytes in the file to send */
+    apr_size_t sendlen = 0;
+    apr_size_t bytes_sent;
+    apr_int32_t i;
+    apr_off_t o;             /* Track the file offset for partial writes */
+    char buffer[8192];
+
+    *nbytes = 0;
+    /* Send the headers
+     * writev_it_all handles partial writes.
+     * XXX: optimization... if headers are less than MIN_WRITE_SIZE, copy
+     * them into buffer
+     */
+    if (hdtr && hdtr->numheaders > 0 ) {
+        for (i = 0; i < hdtr->numheaders; i++) {
+            sendlen += hdtr->headers[i].iov_len;
+        }
+
+        rv = writev_it_all_sctp(c->client_socket, hdtr->headers,
+                hdtr->numheaders, sendlen, &bytes_sent,
+                c->sctp_stream_info);
+
+        if (rv == APR_SUCCESS)
+            *nbytes += bytes_sent;     /* track total bytes sent */
+    }
+
+    /* Seek the file to 'offset' */
+    if (offset >= 0 && rv == APR_SUCCESS) {
+        rv = apr_file_seek(fd, APR_SET, &offset);
+    }
+
+   /* Send the file, making sure to handle partial writes */
+    togo = length;
+    while (rv == APR_SUCCESS && togo) {
+        sendlen = togo > sizeof(buffer) ? sizeof(buffer) : togo;
+        o = 0;
+
+        /*
+         * PN - 9/20/2005
+         * Chunking messages to be of size = 1408 bytes, which is
+         * the recommended SCTP msg chunk size, for better performance
+         */
+        if (sendlen > 1408) {
+                sendlen = 1408;
+        }
+        rv = apr_file_read(fd, buffer, &sendlen);
+        while (rv == APR_SUCCESS && sendlen) {
+            bytes_sent = sendlen;
+
+            rv = apr_socket_send_sctp(c->client_socket, &buffer[o],
+                        &bytes_sent, c->sctp_stream_info);
+
+            if (rv == APR_SUCCESS) {
+                sendlen -= bytes_sent; /* sendlen != bytes_sent=>partial write */
+                o += bytes_sent;       /* o is where we are in the buffer */
+                *nbytes += bytes_sent;
+                togo -= bytes_sent;    /* track how much of the file we've sent */
+            }
+        }
+    }
+
+    /* Send the trailers
+     * XXX: optimization... if it will fit, send this on the last send in the
+     * loop above
+     */
+    sendlen = 0;
+    if ( rv == APR_SUCCESS && hdtr && hdtr->numtrailers > 0 ) {
+        for (i = 0; i < hdtr->numtrailers; i++) {
+            sendlen += hdtr->trailers[i].iov_len;
+        }
+
+        rv = writev_it_all_sctp(c->client_socket, hdtr->trailers,
+               hdtr->numtrailers, sendlen, &bytes_sent, c->sctp_stream_info);
+
+        if (rv == APR_SUCCESS)
+            *nbytes += bytes_sent;
+    }
+
+    return rv;
+}
+#endif /* End APR_HAS_SCTP_STREAMS */
+
+
+/*
+ * emulate_sendfile()
+ * Sends the contents of file fd along with header/trailer bytes, if any,
+ * to the network. emulate_sendfile will return only when all the bytes have been
+ * sent (i.e., it handles partial writes) or on a network error condition.
+ */
+static apr_status_t emulate_sendfile(core_net_rec *c, apr_file_t *fd,
+                                     apr_hdtr_t *hdtr, apr_off_t offset,
+                                     apr_size_t length, apr_size_t *nbytes)
+{
+    apr_status_t rv = APR_SUCCESS;
+    apr_int32_t togo;        /* Remaining number of bytes in the file to send */
+    apr_size_t sendlen = 0;
+    apr_size_t bytes_sent;
+    apr_int32_t i;
+    apr_off_t o;             /* Track the file offset for partial writes */
+    char buffer[8192];
+
+    *nbytes = 0;
+
+    /* Send the headers
+     * writev_it_all handles partial writes.
+     * XXX: optimization... if headers are less than MIN_WRITE_SIZE, copy
+     * them into buffer
+     */
+    if (hdtr && hdtr->numheaders > 0 ) {
+        for (i = 0; i < hdtr->numheaders; i++) {
+            sendlen += hdtr->headers[i].iov_len;
+        }
+
+        rv = writev_it_all(c->client_socket, hdtr->headers, hdtr->numheaders,
+                           sendlen, &bytes_sent);
+        if (rv == APR_SUCCESS)
+            *nbytes += bytes_sent;     /* track total bytes sent */
+    }
+
+    /* Seek the file to 'offset' */
+    if (offset >= 0 && rv == APR_SUCCESS) {
+        rv = apr_file_seek(fd, APR_SET, &offset);
+    }
+
+    /* Send the file, making sure to handle partial writes */
+    togo = length;
+    while (rv == APR_SUCCESS && togo) {
+        sendlen = togo > sizeof(buffer) ? sizeof(buffer) : togo;
+        o = 0;
+        rv = apr_file_read(fd, buffer, &sendlen);
+        while (rv == APR_SUCCESS && sendlen) {
+            bytes_sent = sendlen;
+            rv = apr_send(c->client_socket, &buffer[o], &bytes_sent);
+            if (rv == APR_SUCCESS) {
+                sendlen -= bytes_sent; /* sendlen != bytes_sent ==> partial write */
+                o += bytes_sent;       /* o is where we are in the buffer */
+                *nbytes += bytes_sent;
+                togo -= bytes_sent;    /* track how much of the file we've sent */
+            }
+>>>>>>> 6036f4fa90... Add SCTP support
         }
     }
     else if (!strcasecmp(arg1, "request")) {
@@ -4808,6 +5035,7 @@ AP_DECLARE(int) ap_sys_privileges_handlers(int inc)
     return sys_privileges;
 }
 
+<<<<<<< HEAD
 static int check_errorlog_dir(apr_pool_t *p, server_rec *s)
 {
     if (!s->error_fname || s->error_fname[0] == '|'
@@ -4821,6 +5049,309 @@ static int check_errorlog_dir(apr_pool_t *p, server_rec *s)
         apr_status_t rv = apr_stat(&finfo, dir, APR_FINFO_TYPE, p);
         if (rv == APR_SUCCESS && finfo.filetype != APR_DIR)
             rv = APR_ENOTDIR;
+=======
+
+/**
+ * PN - 10/20/2005
+ * This is a helper function local to core.c
+ * Takes in bucket with SCTP stream id information and copies it
+ * to core_net_rec structure
+ */
+static int get_sctp_stream_information(apr_bucket *sctp_stream_bkt,
+                                       core_net_rec *net)
+{
+
+    const char *str;
+    apr_size_t len;
+    apr_status_t ret_val;
+
+    /* read the heap bucket for SCTP stream information */
+    ret_val = apr_bucket_read(sctp_stream_bkt, &str,
+                            &len, APR_BLOCK_READ);
+    if (ret_val != APR_SUCCESS) {
+
+       /* Uncomment for debugging */
+       /* ap_log_error(APLOG_MARK, APLOG_NOTICE, ret_val, NULL,
+                    "Core Input Filter: bucket read error: %d\n", ret_val); */
+        return ret_val;
+    }
+
+    /*
+     * Copy the SCTP stream id to the
+     * core_net_rec for this request
+     */
+
+    memcpy(&(net->sctp_stream_info), str, sizeof(apr_uint16_t));
+
+    /* Uncomment for debugging */
+    /* ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, NULL,
+                        "Core Input Filter: SCTP Stream: %ho",
+                        net->sctp_stream_info); */
+
+    return APR_SUCCESS;
+
+}
+
+static int core_input_filter(ap_filter_t *f, apr_bucket_brigade *b,
+                             ap_input_mode_t mode, apr_read_type_e block,
+                             apr_off_t readbytes)
+{
+    apr_bucket *e;
+    apr_status_t rv;
+    core_net_rec *net = f->ctx;
+    core_ctx_t *ctx = net->in_ctx;
+    const char *str;
+    apr_size_t len;
+
+    /* PN - 08/15/2005 */
+    apr_int32_t protocol = 0;
+
+    if (mode == AP_MODE_INIT) {
+        /*
+         * this mode is for filters that might need to 'initialize'
+         * a connection before reading request data from a client.
+         * NNTP over SSL for example needs to handshake before the
+         * server sends the welcome message.
+         * such filters would have changed the mode before this point
+         * is reached.  however, protocol modules such as NNTP should
+         * not need to know anything about SSL.  given the example, if
+         * SSL is not in the filter chain, AP_MODE_INIT is a noop.
+         */
+        return APR_SUCCESS;
+    }
+
+    if (!ctx)
+    {
+        ctx = apr_pcalloc(f->c->pool, sizeof(*ctx));
+        ctx->b = apr_brigade_create(f->c->pool, f->c->bucket_alloc);
+        ctx->tmpbb = apr_brigade_create(ctx->b->p, ctx->b->bucket_alloc);
+
+        /* seed the brigade with the client socket. */
+        e = apr_bucket_socket_create(net->client_socket, f->c->bucket_alloc);
+        APR_BRIGADE_INSERT_TAIL(ctx->b, e);
+        net->in_ctx = ctx;
+    }
+    else if (APR_BRIGADE_EMPTY(ctx->b)) {
+        return APR_EOF;
+    }
+
+    /* ### This is bad. */
+    BRIGADE_NORMALIZE(ctx->b);
+
+    /* check for empty brigade again *AFTER* BRIGADE_NORMALIZE()
+     * If we have lost our socket bucket (see above), we are EOF.
+     *
+     * Ideally, this should be returning SUCCESS with EOS bucket, but
+     * some higher-up APIs (spec. read_request_line via ap_rgetline)
+     * want an error code. */
+    if (APR_BRIGADE_EMPTY(ctx->b)) {
+        return APR_EOF;
+    }
+
+    /*
+     * PN - 10/17/2005
+     */
+
+#if APR_HAS_SCTP_STREAMS
+
+    if (APR_BUCKET_IS_SOCKET(APR_BRIGADE_FIRST(ctx->b))) {
+
+        /*
+         * PN - 10/17/2005
+         * protocol is non-zero only if first bucket in ctx->b
+         * is a socket bucket. Else zero as defined during decl.
+         */
+
+        apr_socket_protocol_get((apr_socket_t *)(net->client_socket),
+                                       &protocol);
+
+    }
+#endif /* End APR_HAS_SCTP_STREAMS */
+
+
+    if (mode == AP_MODE_GETLINE) {
+        /* we are reading a single LF line, e.g. the HTTP headers */
+        rv = apr_brigade_split_line(b, ctx->b, block, HUGE_STRING_LEN);
+
+        /*
+         * PN - 8/16/2005
+         * if (APR_HAS_SCTP_STREAMS and protcol == SCTP), then
+         * after calling apr_brigade_split_line,
+         * first bucket in b (apr_brigade_split_line's bbOut)
+         * will be a heap bucket having the
+         * SCTP stream id on which the HTTP request was read from client.
+         */
+
+#if APR_HAS_SCTP_STREAMS
+
+        if (rv == APR_SUCCESS) {
+
+                   if (protocol == APR_PROTO_SCTP) {
+
+                /*
+                 * protocol non-zero implies socket read
+                 */
+               apr_bucket *sctp_stream_info = APR_BRIGADE_FIRST(b);
+               apr_status_t ret_val;
+
+               /* Get the sctp stream information */
+               ret_val = get_sctp_stream_information(sctp_stream_info, net);
+               if (ret_val != APR_SUCCESS)
+                       return ret_val;
+
+	       /*
+                * Remove and destroy the bucket with SCTP stream information
+                */
+               apr_bucket_delete(sctp_stream_info);
+
+            } /* end APR_PROTO_SCTP */
+
+        } /* end rv == SUCCESS */
+
+#endif  /* End APR_HAS_SCTP_STREAMS */
+
+        /* We should treat EAGAIN here the same as we do for EOF (brigade is
+         * empty).  We do this by returning whatever we have read.  This may
+         * or may not be bogus, but is consistent (for now) with EOF logic.
+         */
+        if (APR_STATUS_IS_EAGAIN(rv)) {
+            rv = APR_SUCCESS;
+        }
+        return rv;
+    }
+
+    /* ### AP_MODE_PEEK is a horrific name for this mode because we also
+     * eat any CRLFs that we see.  That's not the obvious intention of
+     * this mode.  Determine whether anyone actually uses this or not. */
+    if (mode == AP_MODE_EATCRLF) {
+        apr_bucket *e;
+        const char *c;
+
+        /* The purpose of this loop is to ignore any CRLF (or LF) at the end
+         * of a request.  Many browsers send extra lines at the end of POST
+         * requests.  We use the PEEK method to determine if there is more
+         * data on the socket, so that we know if we should delay sending the
+         * end of one request until we have served the second request in a
+         * pipelined situation.  We don't want to actually delay sending a
+         * response if the server finds a CRLF (or LF), becuause that doesn't
+         * mean that there is another request, just a blank line.
+         */
+        while (1) {
+            if (APR_BRIGADE_EMPTY(ctx->b))
+                return APR_EOF;
+
+            e = APR_BRIGADE_FIRST(ctx->b);
+
+            rv = apr_bucket_read(e, &str, &len, APR_NONBLOCK_READ);
+
+            if (rv != APR_SUCCESS)
+                return rv;
+
+#if APR_HAS_SCTP_STREAMS
+
+           if (protocol == APR_PROTO_SCTP) {
+
+                /*
+                 * protocol non-zero implies socket read
+                 */
+               apr_bucket *sctp_stream_info = APR_BUCKET_PREV(e);
+               apr_status_t ret_val;
+
+               /* Get the sctp stream information */
+               ret_val = get_sctp_stream_information(sctp_stream_info, net);
+               if (ret_val != APR_SUCCESS)
+                       return ret_val;
+
+               /* Remove and destroy the bucket with SCTP stream information */
+               apr_bucket_delete(sctp_stream_info);
+           }
+#endif
+
+            c = str;
+            while (c < str + len) {
+                if (*c == APR_ASCII_LF)
+                    c++;
+                else if (*c == APR_ASCII_CR && *(c + 1) == APR_ASCII_LF)
+                    c += 2;
+                else
+                    return APR_SUCCESS;
+            }
+
+            /* If we reach here, we were a bucket just full of CRLFs, so
+             * just toss the bucket. */
+            /* FIXME: Is this the right thing to do in the core? */
+            apr_bucket_delete(e);
+        }
+        return APR_SUCCESS;
+    }
+
+    /* If mode is EXHAUSTIVE, we want to just read everything until the end
+     * of the brigade, which in this case means the end of the socket.
+     * To do this, we attach the brigade that has currently been setaside to
+     * the brigade that was passed down, and send that brigade back.
+     *
+     * NOTE:  This is VERY dangerous to use, and should only be done with
+     * extreme caution.  However, the Perchild MPM needs this feature
+     * if it is ever going to work correctly again.  With this, the Perchild
+     * MPM can easily request the socket and all data that has been read,
+     * which means that it can pass it to the correct child process.
+     */
+    if (mode == AP_MODE_EXHAUSTIVE) {
+        apr_bucket *e;
+
+        /* Tack on any buckets that were set aside. */
+        APR_BRIGADE_CONCAT(b, ctx->b);
+
+        /* Since we've just added all potential buckets (which will most
+         * likely simply be the socket bucket) we know this is the end,
+         * so tack on an EOS too. */
+        /* We have read until the brigade was empty, so we know that we
+         * must be EOS. */
+        e = apr_bucket_eos_create(f->c->bucket_alloc);
+        APR_BRIGADE_INSERT_TAIL(b, e);
+        return APR_SUCCESS;
+    }
+
+    /* read up to the amount they specified. */
+    if (mode == AP_MODE_READBYTES || mode == AP_MODE_SPECULATIVE) {
+        apr_bucket *e;
+
+        AP_DEBUG_ASSERT(readbytes > 0);
+
+        e = APR_BRIGADE_FIRST(ctx->b);
+        rv = apr_bucket_read(e, &str, &len, block);
+
+        if (APR_STATUS_IS_EAGAIN(rv)) {
+            return APR_SUCCESS;
+        }
+        else if (rv != APR_SUCCESS) {
+            return rv;
+        }
+        else if (block == APR_BLOCK_READ && len == 0) {
+            /* We wanted to read some bytes in blocking mode.  We read
+             * 0 bytes.  Hence, we now assume we are EOS.
+             *
+             * When we are in normal mode, return an EOS bucket to the
+             * caller.
+             * When we are in speculative mode, leave ctx->b empty, so
+             * that the next call returns an EOS bucket.
+             */
+            apr_bucket_delete(e);
+
+            if (mode == AP_MODE_READBYTES) {
+                e = apr_bucket_eos_create(f->c->bucket_alloc);
+                APR_BRIGADE_INSERT_TAIL(b, e);
+            }
+            return APR_SUCCESS;
+        }
+
+        /* We can only return at most what we read. */
+        if (len < readbytes) {
+            readbytes = len;
+        }
+
+        rv = apr_brigade_partition(ctx->b, readbytes, &e);
+>>>>>>> 6036f4fa90... Add SCTP support
         if (rv != APR_SUCCESS) {
             const char *desc = "main error log";
             if (s->defn_name)
@@ -4837,6 +5368,7 @@ static int check_errorlog_dir(apr_pool_t *p, server_rec *s)
 
 static int core_check_config(apr_pool_t *pconf, apr_pool_t *plog, apr_pool_t *ptemp, server_rec *s)
 {
+<<<<<<< HEAD
     int rv = OK;
     while (s) {
         if (check_errorlog_dir(ptemp, s) != OK)
@@ -4845,6 +5377,425 @@ static int core_check_config(apr_pool_t *pconf, apr_pool_t *plog, apr_pool_t *pt
     }
     return rv;
 }
+=======
+    apr_status_t rv;
+    apr_bucket_brigade *more;
+    conn_rec *c = f->c;
+    core_net_rec *net = f->ctx;
+    core_output_filter_ctx_t *ctx = net->out_ctx;
+    apr_read_type_e eblock = APR_NONBLOCK_READ;
+    apr_pool_t *input_pool = b->p;
+
+    /*
+     * PN - 10/13/2005
+     * Get the transport protocol apache is using
+     */
+    apr_int32_t protocol = 0;
+    apr_socket_protocol_get((apr_socket_t *)(net->client_socket), &protocol);
+
+    if (ctx == NULL) {
+        ctx = apr_pcalloc(c->pool, sizeof(*ctx));
+        net->out_ctx = ctx;
+    }
+
+    /* If we have a saved brigade, concatenate the new brigade to it */
+    if (ctx->b) {
+        APR_BRIGADE_CONCAT(ctx->b, b);
+        b = ctx->b;
+        ctx->b = NULL;
+    }
+
+    /* Perform multiple passes over the brigade, sending batches of output
+       to the connection. */
+    while (b && !APR_BRIGADE_EMPTY(b)) {
+        apr_size_t nbytes = 0;
+        apr_bucket *last_e = NULL; /* initialized for debugging */
+        apr_bucket *e;
+
+        /* one group of iovecs per pass over the brigade */
+        apr_size_t nvec = 0;
+        apr_size_t nvec_trailers = 0;
+        struct iovec vec[MAX_IOVEC_TO_WRITE];
+        struct iovec vec_trailers[MAX_IOVEC_TO_WRITE];
+
+        /* one file per pass over the brigade */
+        apr_file_t *fd = NULL;
+        apr_size_t flen = 0;
+        apr_off_t foffset = 0;
+
+        /* keep track of buckets that we've concatenated
+         * to avoid small writes
+         */
+        apr_bucket *last_merged_bucket = NULL;
+
+        /* tail of brigade if we need another pass */
+        more = NULL;
+
+        /* Iterate over the brigade: collect iovecs and/or a file */
+        APR_BRIGADE_FOREACH(e, b) {
+            /* keep track of the last bucket processed */
+            last_e = e;
+            if (APR_BUCKET_IS_EOS(e) || AP_BUCKET_IS_EOC(e)) {
+                break;
+            }
+            else if (APR_BUCKET_IS_FLUSH(e)) {
+                if (e != APR_BRIGADE_LAST(b)) {
+                    more = apr_brigade_split(b, APR_BUCKET_NEXT(e));
+                }
+                break;
+            }
+
+            /* It doesn't make any sense to use sendfile for a file bucket
+             * that represents 10 bytes.
+             */
+            else if (APR_BUCKET_IS_FILE(e)
+                     && (e->length >= AP_MIN_SENDFILE_BYTES)) {
+                apr_bucket_file *a = e->data;
+
+                /* We can't handle more than one file bucket at a time
+                 * so we split here and send the file we have already
+                 * found.
+                 */
+                if (fd) {
+                    more = apr_brigade_split(b, e);
+                    break;
+                }
+
+                fd = a->fd;
+                flen = e->length;
+                foffset = e->start;
+            }
+            else {
+                const char *str;
+                apr_size_t n;
+
+                rv = apr_bucket_read(e, &str, &n, eblock);
+                if (APR_STATUS_IS_EAGAIN(rv)) {
+                    /* send what we have so far since we shouldn't expect more
+                     * output for a while...  next time we read, block
+                     */
+                    more = apr_brigade_split(b, e);
+                    eblock = APR_BLOCK_READ;
+                    break;
+                }
+                eblock = APR_NONBLOCK_READ;
+                if (n) {
+                    if (!fd) {
+                        if (nvec == MAX_IOVEC_TO_WRITE) {
+                            /* woah! too many. buffer them up, for use later. */
+                            apr_bucket *temp, *next;
+                            apr_bucket_brigade *temp_brig;
+
+                            if (nbytes >= AP_MIN_BYTES_TO_WRITE) {
+                                /* We have enough data in the iovec
+                                 * to justify doing a writev
+                                 */
+                                more = apr_brigade_split(b, e);
+                                break;
+                            }
+
+                            /* Create a temporary brigade as a means
+                             * of concatenating a bunch of buckets together
+                             */
+                            if (last_merged_bucket) {
+                                /* If we've concatenated together small
+                                 * buckets already in a previous pass,
+                                 * the initial buckets in this brigade
+                                 * are heap buckets that may have extra
+                                 * space left in them (because they
+                                 * were created by apr_brigade_write()).
+                                 * We can take advantage of this by
+                                 * building the new temp brigade out of
+                                 * these buckets, so that the content
+                                 * in them doesn't have to be copied again.
+                                 */
+                                apr_bucket_brigade *bb;
+                                bb = apr_brigade_split(b,
+                                         APR_BUCKET_NEXT(last_merged_bucket));
+                                temp_brig = b;
+                                b = bb;
+                            }
+                            else {
+                                temp_brig = apr_brigade_create(f->c->pool,
+                                                           f->c->bucket_alloc);
+                            }
+
+                            temp = APR_BRIGADE_FIRST(b);
+                            while (temp != e) {
+                                apr_bucket *d;
+                                rv = apr_bucket_read(temp, &str, &n, APR_BLOCK_READ);
+                                apr_brigade_write(temp_brig, NULL, NULL, str, n);
+                                d = temp;
+                                temp = APR_BUCKET_NEXT(temp);
+                                apr_bucket_delete(d);
+                            }
+
+                            nvec = 0;
+                            nbytes = 0;
+                            temp = APR_BRIGADE_FIRST(temp_brig);
+                            APR_BUCKET_REMOVE(temp);
+                            APR_BRIGADE_INSERT_HEAD(b, temp);
+                            apr_bucket_read(temp, &str, &n, APR_BLOCK_READ);
+                            vec[nvec].iov_base = (char*) str;
+                            vec[nvec].iov_len = n;
+                            nvec++;
+
+                            /* Just in case the temporary brigade has
+                             * multiple buckets, recover the rest of
+                             * them and put them in the brigade that
+                             * we're sending.
+                             */
+                            for (next = APR_BRIGADE_FIRST(temp_brig);
+                                 next != APR_BRIGADE_SENTINEL(temp_brig);
+                                 next = APR_BRIGADE_FIRST(temp_brig)) {
+                                APR_BUCKET_REMOVE(next);
+                                APR_BUCKET_INSERT_AFTER(temp, next);
+                                temp = next;
+                                apr_bucket_read(next, &str, &n,
+                                                APR_BLOCK_READ);
+                                vec[nvec].iov_base = (char*) str;
+                                vec[nvec].iov_len = n;
+                                nvec++;
+                            }
+
+                            apr_brigade_destroy(temp_brig);
+
+                            last_merged_bucket = temp;
+                            e = temp;
+                            last_e = e;
+                        }
+                        else {
+                            vec[nvec].iov_base = (char*) str;
+                            vec[nvec].iov_len = n;
+                            nvec++;
+                        }
+                    }
+                    else {
+                        /* The bucket is a trailer to a file bucket */
+
+                        if (nvec_trailers == MAX_IOVEC_TO_WRITE) {
+                            /* woah! too many. stop now. */
+                            more = apr_brigade_split(b, e);
+                            break;
+                        }
+
+                        vec_trailers[nvec_trailers].iov_base = (char*) str;
+                        vec_trailers[nvec_trailers].iov_len = n;
+                        nvec_trailers++;
+                    }
+
+                    nbytes += n;
+                }
+            }
+        }
+
+
+        /* Completed iterating over the brigade, now determine if we want
+         * to buffer the brigade or send the brigade out on the network.
+         *
+         * Save if we haven't accumulated enough bytes to send, the connection
+         * is not about to be closed, and:
+         *
+         *   1) we didn't see a file, we don't have more passes over the
+         *      brigade to perform,  AND we didn't stop at a FLUSH bucket.
+         *      (IOW, we will save plain old bytes such as HTTP headers)
+         * or
+         *   2) we hit the EOS and have a keep-alive connection
+         *      (IOW, this response is a bit more complex, but we save it
+         *       with the hope of concatenating with another response)
+         */
+        if (nbytes + flen < AP_MIN_BYTES_TO_WRITE
+            && !AP_BUCKET_IS_EOC(last_e)
+            && ((!fd && !more && !APR_BUCKET_IS_FLUSH(last_e))
+                || (APR_BUCKET_IS_EOS(last_e)
+                    && c->keepalive == AP_CONN_KEEPALIVE))) {
+
+            /* NEVER save an EOS in here.  If we are saving a brigade with
+             * an EOS bucket, then we are doing keepalive connections, and
+             * we want to process to second request fully.
+             */
+            if (APR_BUCKET_IS_EOS(last_e)) {
+                apr_bucket *bucket;
+                int file_bucket_saved = 0;
+                apr_bucket_delete(last_e);
+                for (bucket = APR_BRIGADE_FIRST(b);
+                     bucket != APR_BRIGADE_SENTINEL(b);
+                     bucket = APR_BUCKET_NEXT(bucket)) {
+
+                    /* Do a read on each bucket to pull in the
+                     * data from pipe and socket buckets, so
+                     * that we don't leave their file descriptors
+                     * open indefinitely.  Do the same for file
+                     * buckets, with one exception: allow the
+                     * first file bucket in the brigade to remain
+                     * a file bucket, so that we don't end up
+                     * doing an mmap+memcpy every time a client
+                     * requests a <8KB file over a keepalive
+                     * connection.
+                     */
+                    if (APR_BUCKET_IS_FILE(bucket) && !file_bucket_saved) {
+                        file_bucket_saved = 1;
+                    }
+                    else {
+                        const char *buf;
+                        apr_size_t len = 0;
+                        rv = apr_bucket_read(bucket, &buf, &len,
+                                             APR_BLOCK_READ);
+                        if (rv != APR_SUCCESS) {
+                            ap_log_cerror(APLOG_MARK, APLOG_ERR, rv,
+                                          c, "core_output_filter:"
+                                          " Error reading from bucket.");
+                            return HTTP_INTERNAL_SERVER_ERROR;
+                        }
+                    }
+                }
+            }
+            if (!ctx->deferred_write_pool) {
+                apr_pool_create(&ctx->deferred_write_pool, c->pool);
+                apr_pool_tag(ctx->deferred_write_pool, "deferred_write");
+            }
+            ap_save_brigade(f, &ctx->b, &b, ctx->deferred_write_pool);
+
+            return APR_SUCCESS;
+        }
+
+        if (fd) {
+            apr_hdtr_t hdtr;
+            apr_size_t bytes_sent;
+
+#if APR_HAS_SENDFILE
+            apr_int32_t flags = 0;
+#endif
+
+            memset(&hdtr, '\0', sizeof(hdtr));
+            if (nvec) {
+                hdtr.numheaders = nvec;
+                hdtr.headers = vec;
+            }
+
+            if (nvec_trailers) {
+                hdtr.numtrailers = nvec_trailers;
+                hdtr.trailers = vec_trailers;
+            }
+
+            /*
+             * PN - 10/17/2005
+             * sendfile_it_all/sendfile cannot send on a SCTP stream. So, 
+             * if (APR_HAS_SCTP_STREAMS and protocol == SCTP) then
+             * use emulate_sendfile_sctp
+             * else do the ususal processing as before to send the file.
+             */
+#if APR_HAS_SCTP_STREAMS
+
+            if (protocol == APR_PROTO_SCTP) {
+               /* Uncomment for debugging */
+                /* ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, NULL,
+                        "Core Output Filter: SCTP Stream: %ho",
+                                net->sctp_stream_info); */
+                rv = emulate_sendfile_sctp(net, fd, &hdtr, foffset, flen,
+                                      &bytes_sent);
+            }
+           else
+#endif /* End APR_HAS_SCTP_STREAMS */
+           {
+
+#if APR_HAS_SENDFILE
+                if (apr_file_flags_get(fd) & APR_SENDFILE_ENABLED) {
+
+                   if (c->keepalive == AP_CONN_CLOSE &&
+                       APR_BUCKET_IS_EOS(last_e)) {
+                        /* Prepare the socket to be reused */
+                        flags |= APR_SENDFILE_DISCONNECT_SOCKET;
+                    }
+
+                    rv = sendfile_it_all(net,    /* the network information   */
+                                     fd,       /* the file to send          */
+                                     &hdtr,    /* header and trailer iovecs */
+                                     foffset,  /* offset in the file to begin
+                                                  sending from              */
+                                     flen,     /* length of file            */
+                                     nbytes + flen, /* total length including
+                                                       headers              */
+                                     &bytes_sent,   /* how many bytes were
+                                                       sent                 */
+                                     flags);   /* apr_sendfile flags        */
+
+                    if (logio_add_bytes_out && bytes_sent > 0)
+                       logio_add_bytes_out(c, bytes_sent);
+               }
+               else
+#endif
+               {
+                    rv = emulate_sendfile(net, fd, &hdtr, foffset, flen,
+                                      &bytes_sent);
+
+                    if (logio_add_bytes_out && bytes_sent > 0)
+                       logio_add_bytes_out(c, bytes_sent);
+               }
+
+           }
+
+            fd = NULL;
+
+        }
+        else {
+            apr_size_t bytes_sent;
+           /*
+             * PN - 10/17/2005
+             * if (APR_HAS_SCTP_STREAMS and protocol == SCTP) then
+             * use emulate_sendfile_sctp else use emulate_sendfile
+             * to send the data
+             */
+#if APR_HAS_SCTP_STREAMS
+
+            if (protocol == APR_PROTO_SCTP) {
+                rv = writev_it_all_sctp(net->client_socket, vec, nvec,
+                            nbytes, &bytes_sent, net->sctp_stream_info);
+
+           }
+            else
+
+#endif  /* End APR_HAS_SCTP_STREAMS */
+           {
+
+                rv = writev_it_all(net->client_socket, vec, nvec,
+                           nbytes, &bytes_sent);
+           }
+
+            if (logio_add_bytes_out && bytes_sent > 0)
+                logio_add_bytes_out(c, bytes_sent);
+        }
+
+        apr_brigade_destroy(b);
+        
+        /* drive cleanups for resources which were set aside 
+         * this may occur before or after termination of the request which
+         * created the resource
+         */
+        if (ctx->deferred_write_pool) {
+            if (more && more->p == ctx->deferred_write_pool) {
+                /* "more" belongs to the deferred_write_pool,
+                 * which is about to be cleared.
+                 */
+                if (APR_BRIGADE_EMPTY(more)) {
+                    more = NULL;
+                }
+                else {
+                    /* uh oh... change more's lifetime 
+                     * to the input brigade's lifetime 
+                     */
+                    apr_bucket_brigade *tmp_more = more;
+                    more = NULL;
+                    ap_save_brigade(f, &more, &tmp_more, input_pool);
+                }
+            }
+            apr_pool_clear(ctx->deferred_write_pool);  
+        }
+
+        if (rv != APR_SUCCESS) {
+            ap_log_cerror(APLOG_MARK, APLOG_INFO, rv, c,
+                          "core_output_filter: writing data to the network");
+>>>>>>> 6036f4fa90... Add SCTP support
 
 
 static int core_pre_config(apr_pool_t *pconf, apr_pool_t *plog, apr_pool_t *ptemp)
@@ -5016,7 +5967,15 @@ static conn_rec *core_create_conn(apr_pool_t *ptrans, server_rec *server,
     c->id = id;
     c->bucket_alloc = alloc;
 
+<<<<<<< HEAD
     c->clogging_input_filters = 0;
+=======
+    /*
+     * PN - 10/14/2005
+     * Put in the transport layer protocol that this connection will use
+     */
+    apr_socket_protocol_get(csd, &(c->transport_protocol));
+>>>>>>> 6036f4fa90... Add SCTP support
 
     return c;
 }

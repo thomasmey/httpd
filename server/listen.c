@@ -287,16 +287,25 @@ static int find_listeners(ap_listen_rec **from, ap_listen_rec **to,
 
         /* Some listeners are not real so they will not have a bind_addr. */
         if (sa) {
+            char *test_addr = addr;
+
             ap_listen_rec *new;
             apr_port_t oldport;
 
             oldport = sa->port;
+
+#if APR_HAVE_SCTP
+            char *end_addr;
+            //check for muliple IPs and grab first one only
+            if (addr && (end_addr = memchr(addr, ',', strlen(addr))))
+                test_addr = apr_pstrmemdup(process->pool, addr, end_addr - addr);
+#endif
             /* If both ports are equivalent, then if their names are equivalent,
              * then we will re-use the existing record.
              */
             if (port == oldport &&
-                ((!addr && !sa->hostname) ||
-                 ((addr && sa->hostname) && !strcmp(sa->hostname, addr)))) {
+                ((!test_addr && !sa->hostname) ||
+                 ((test_addr && sa->hostname) && !strcmp(sa->hostname, test_addr)))) {
                 found = 1;
                 if (!to) {
                     break;
@@ -317,7 +326,7 @@ static int find_listeners(ap_listen_rec **from, ap_listen_rec **to,
 
 static const char *alloc_listener(process_rec *process, const char *addr,
                                   apr_port_t port, const char* proto,
-                                  void *slave)
+                                  void *slave, apr_int32_t transport_proto)
 {
     ap_listen_rec *last;
     apr_status_t status;
@@ -342,7 +351,10 @@ static const char *alloc_listener(process_rec *process, const char *addr,
         ap_log_perror(APLOG_MARK, APLOG_CRIT, status, process->pool, APLOGNO(00077)
                       "alloc_listener: failed to set up sockaddr for %s",
                       addr);
-        return "Listen setup failed";
+        if (transport_proto == APR_PROTO_SCTP)
+            return "ListenSCTP setup failed";
+        else
+            return "Listen setup failed";
     }
 
     /* Initialize to our last configured ap_listener. */
@@ -365,7 +377,7 @@ static const char *alloc_listener(process_rec *process, const char *addr,
         sa = sa->next;
 
         status = apr_socket_create(&new->sd, new->bind_addr->family,
-                                    SOCK_STREAM, 0, process->pool);
+                                    SOCK_STREAM, transport_proto, process->pool);
 
 #if APR_HAVE_IPV6
         /* What could happen is that we got an IPv6 address, but this system
@@ -380,7 +392,10 @@ static const char *alloc_listener(process_rec *process, const char *addr,
             ap_log_perror(APLOG_MARK, APLOG_CRIT, status, process->pool, APLOGNO(00078)
                           "alloc_listener: failed to get a socket for %s",
                           addr);
-            return "Listen setup failed";
+            if (transport_proto == APR_PROTO_SCTP)
+                return "ListenSCTP setup failed";
+            else
+                return "Listen setup failed";
         }
 
         /* We need to preserve the order returned by getaddrinfo() */
@@ -826,7 +841,27 @@ AP_DECLARE_NONSTD(const char *) ap_set_listener(cmd_parms *cmd, void *dummy,
         return "Listen requires 1 or 2 arguments.";
     }
 
-    rv = apr_parse_addr_port(&host, &scope_id, &port, argv[0], cmd->pool);
+    /*
+     * PN - 8/16/2005
+     */
+    apr_uint32_t transport_proto = APR_PROTO_TCP;
+
+#if APR_HAVE_SCTP
+    char *data = cmd->cmd->cmd_data;
+    if (data) {
+        if(!strncmp(data, "SCTP", 4)) {
+            transport_proto = APR_PROTO_SCTP;
+            rv = apr_parse_multiaddr_port(&host, &scope_id, &port, ips,
+                                          cmd->pool);
+        } else {
+            return "Invalid cmd_data specified in cmd->cmd->cmd_data";
+        }
+    } else
+#endif
+    {
+        rv = apr_parse_addr_port(&host, &scope_id, &port, argv[0], cmd->pool);
+    }
+
     if (rv != APR_SUCCESS) {
         return "Invalid address or port";
     }
@@ -856,7 +891,7 @@ AP_DECLARE_NONSTD(const char *) ap_set_listener(cmd_parms *cmd, void *dummy,
         ap_str_tolower(proto);
     }
 
-    return alloc_listener(cmd->server->process, host, port, proto, NULL);
+    return alloc_listener(cmd->server->process, host, port, proto, NULL, transport_proto);
 }
 
 AP_DECLARE_NONSTD(const char *) ap_set_listenbacklog(cmd_parms *cmd,

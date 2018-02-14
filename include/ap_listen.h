@@ -143,6 +143,10 @@ AP_DECLARE_NONSTD(const char *) ap_set_receive_buffer_size(cmd_parms *cmd,
                                                            void *dummy,
                                                            const char *arg);
 
+/* JTL - 2013-MAR-20
+ * added ListenSCTP directive for specifying the use of SCTP in place of TCP.
+ * The directive is processed with RAW_ARGS to accomodate specifying multiple
+ * IP addresses for use in binding the SCTP listen socket. */
 #define LISTEN_COMMANDS \
 AP_INIT_TAKE1("ListenBacklog", ap_set_listenbacklog, NULL, RSRC_CONF, \
   "Maximum length of the queue of pending connections, as used by listen(2)"), \
@@ -153,7 +157,9 @@ AP_INIT_TAKE_ARGV("Listen", ap_set_listener, NULL, RSRC_CONF, \
 AP_INIT_TAKE1("SendBufferSize", ap_set_send_buffer_size, NULL, RSRC_CONF, \
   "Send buffer size in bytes"), \
 AP_INIT_TAKE1("ReceiveBufferSize", ap_set_receive_buffer_size, NULL, \
-              RSRC_CONF, "Receive buffer size in bytes")
+              RSRC_CONF, "Receive buffer size in bytes"), \
+AP_INIT_RAW_ARGS("ListenSCTP", ap_set_listener, "SCTP", RSRC_CONF, \
+  "A port number or a CSV list of numeric IPV4 address enclosed in braces {} and followed by a port number")
 
 #ifdef __cplusplus
 }

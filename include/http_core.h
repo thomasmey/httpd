@@ -773,6 +773,12 @@ typedef struct core_net_rec {
     /** Connection to the client */
     apr_socket_t *client_socket;
 
+    /** SCTP stream information for this network record */
+    /*
+     * PN - 8/15/2005
+     */
+    apr_uint16_t sctp_stream_info;
+
     /** connection record */
     conn_rec *c;
 
