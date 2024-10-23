@@ -312,6 +312,11 @@ jobs:
               APU_CONFIG="--without-crypto"
             pkgs: subversion
           # -------------------------------------------------------------------------
+          - name: Code coverage
+            config: --enable-debugger-mode
+            env: |
+              MFLAGS=--coverage
+          # -------------------------------------------------------------------------
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
